@@ -1,0 +1,16 @@
+services:
+  skill-market:
+    build: .
+    image: deepy-skill-market:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SKILL_MARKET_DATA_DIR: /data
+    ports:
+      - "8000:8000"
+    volumes:
+      - skill_market_data:/data
+
+volumes:
+  skill_market_data:
