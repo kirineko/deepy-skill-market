@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
@@ -80,13 +82,20 @@ def create_app(data_dir: Path | None = None, admin_token: str | None = None) -> 
                 safe_extract(zip_path, extract_path)
                 skill_md = find_single_skill(extract_path)
                 frontmatter, _body = split_frontmatter(skill_md.read_text(encoding="utf-8"))
+                metadata = parse_metadata(frontmatter.get("metadata"))
+                category = frontmatter.get("category", "")
+                if not isinstance(category, str):
+                    raise ValueError("category must be a string")
+                category = category.strip()
             except (OSError, ValueError, zipfile.BadZipFile) as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             name = clean_scalar(frontmatter.get("name")) or skill_md.parent.name
             description = clean_scalar(frontmatter.get("description"))
             if not name:
                 raise HTTPException(status_code=400, detail="Skill name is required")
-            version = clean_scalar(frontmatter.get("version")) or digest[:12]
+            version_value = frontmatter.get("version") or metadata.get("version")
+            version = str(version_value).strip() if isinstance(version_value, (str, int, float)) else ""
+            version = version or digest[:12]
             stored_zip = zips_dir / f"{name}-{upload_id}.zip"
             stored_extract = extracted_dir / f"{name}-{upload_id}"
             stored_zip.write_bytes(blob)
@@ -97,7 +106,8 @@ def create_app(data_dir: Path | None = None, admin_token: str | None = None) -> 
             description=description,
             license_value=clean_scalar(frontmatter.get("license")),
             compatibility=clean_scalar(frontmatter.get("compatibility")),
-            metadata_json=metadata_json(frontmatter.get("metadata")),
+            metadata_json=json.dumps(metadata, ensure_ascii=False),
+            category=category,
             version=version,
             filename=package.filename or stored_zip.name,
             zip_path=str(stored_zip),
@@ -112,6 +122,8 @@ def create_app(data_dir: Path | None = None, admin_token: str | None = None) -> 
                 "version_id": version_id,
                 "name": name,
                 "description": description,
+                "metadata": metadata,
+                "category": category,
                 "version": version,
                 "sha256": digest,
                 "uploaded_at": now,
@@ -133,12 +145,16 @@ def init_db(path: Path) -> None:
                 license TEXT NOT NULL DEFAULT '',
                 compatibility TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
                 latest_version_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(skills)")}
+        if "category" not in columns:
+            conn.execute("ALTER TABLE skills ADD COLUMN category TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS skill_versions (
@@ -169,8 +185,8 @@ def upsert_skill_version(path: Path, **data: Any) -> tuple[str, str]:
             conn.execute(
                 """
                 INSERT INTO skills
-                (id, name, description, license, compatibility, metadata_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, description, license, compatibility, metadata_json, category, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     skill_id,
@@ -179,6 +195,7 @@ def upsert_skill_version(path: Path, **data: Any) -> tuple[str, str]:
                     data["license_value"],
                     data["compatibility"],
                     data["metadata_json"],
+                    data["category"],
                     now,
                     now,
                 ),
@@ -188,7 +205,7 @@ def upsert_skill_version(path: Path, **data: Any) -> tuple[str, str]:
             conn.execute(
                 """
                 UPDATE skills
-                SET description = ?, license = ?, compatibility = ?, metadata_json = ?, updated_at = ?
+                SET description = ?, license = ?, compatibility = ?, metadata_json = ?, category = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -196,6 +213,7 @@ def upsert_skill_version(path: Path, **data: Any) -> tuple[str, str]:
                     data["license_value"],
                     data["compatibility"],
                     data["metadata_json"],
+                    data["category"],
                     now,
                     skill_id,
                 ),
@@ -260,7 +278,8 @@ def public_skill(row: sqlite3.Row) -> dict[str, Any]:
         "description": row["description"],
         "license": row["license"],
         "compatibility": row["compatibility"],
-        "metadata": row["metadata_json"],
+        "metadata": legacy_metadata(row["metadata_json"]),
+        "category": row["category"],
         "version": row["version"],
         "sha256": row["sha256"],
         "size_bytes": row["size_bytes"],
@@ -297,14 +316,14 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 
 def parse_simple_yaml(lines: list[str]) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    for line in lines:
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        if key:
-            data[key] = value.strip().strip('"').strip("'")
+    try:
+        data = yaml.safe_load("\n".join(lines))
+    except yaml.YAMLError as exc:
+        raise ValueError("Invalid YAML frontmatter") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("Frontmatter must be an object")
     return data
 
 
@@ -312,8 +331,34 @@ def clean_scalar(value: Any) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else ""
 
 
-def metadata_json(value: Any) -> str:
-    return value if isinstance(value, str) else ""
+def parse_metadata(value: Any) -> dict[str, Any]:
+    if value is None or value == "":
+        value = {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("metadata must be an object or a JSON object string") from exc
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError("metadata must be an object with string keys")
+    result = dict(value)
+    source = result.get("source", "")
+    if not isinstance(source, str):
+        raise ValueError("metadata.source must be a string")
+    result["source"] = source.strip()
+    try:
+        json.dumps(result, allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("metadata must contain JSON-compatible values") from exc
+    return result
+
+
+def legacy_metadata(value: str) -> dict[str, Any]:
+    try:
+        return parse_metadata(value)
+    except ValueError:
+        # Keep unstructured legacy content available without breaking list/detail APIs.
+        return {"source": "", "legacy_raw": value}
 
 
 app = create_app()
